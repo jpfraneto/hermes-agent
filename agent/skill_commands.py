@@ -1,151 +1,33 @@
-"""Shared slash command helpers for skills and built-in prompt-style modes.
+"""Skill slash commands — scan installed skills and build invocation messages.
 
 Shared between CLI (cli.py) and gateway (gateway/run.py) so both surfaces
-can invoke skills via /skill-name commands and prompt-only built-ins like
-/plan.
+can invoke skills via /skill-name commands.
 """
 
-import json
 import logging
 import re
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
-_PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
-def build_plan_path(
-    user_instruction: str = "",
-    *,
-    now: datetime | None = None,
-) -> Path:
-    """Return the default workspace-relative markdown path for a /plan invocation.
-
-    Relative paths are intentional: file tools are task/backend-aware and resolve
-    them against the active working directory for local, docker, ssh, modal,
-    daytona, and similar terminal backends. That keeps the plan with the active
-    workspace instead of the Hermes host's global home directory.
-    """
-    slug_source = (user_instruction or "").strip().splitlines()[0] if user_instruction else ""
-    slug = _PLAN_SLUG_RE.sub("-", slug_source.lower()).strip("-")
-    if slug:
-        slug = "-".join(part for part in slug.split("-")[:8] if part)[:48].strip("-")
-    slug = slug or "conversation-plan"
-    timestamp = (now or datetime.now()).strftime("%Y-%m-%d_%H%M%S")
-    return Path(".hermes") / "plans" / f"{timestamp}-{slug}.md"
+def _coerce_string_list(value: Any) -> List[str]:
+    """Coerce a frontmatter value into a list of non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
 
 
-def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
-    """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
-    raw_identifier = (skill_identifier or "").strip()
-    if not raw_identifier:
-        return None
-
-    try:
-        from tools.skills_tool import SKILLS_DIR, skill_view
-
-        identifier_path = Path(raw_identifier).expanduser()
-        if identifier_path.is_absolute():
-            try:
-                normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve()))
-            except Exception:
-                normalized = raw_identifier
-        else:
-            normalized = raw_identifier.lstrip("/")
-
-        loaded_skill = json.loads(skill_view(normalized, task_id=task_id))
-    except Exception:
-        return None
-
-    if not loaded_skill.get("success"):
-        return None
-
-    skill_name = str(loaded_skill.get("name") or normalized)
-    skill_path = str(loaded_skill.get("path") or "")
-    skill_dir = None
-    if skill_path:
-        try:
-            skill_dir = SKILLS_DIR / Path(skill_path).parent
-        except Exception:
-            skill_dir = None
-
-    return loaded_skill, skill_dir, skill_name
-
-
-def _build_skill_message(
-    loaded_skill: dict[str, Any],
-    skill_dir: Path | None,
-    activation_note: str,
-    user_instruction: str = "",
-    runtime_note: str = "",
-) -> str:
-    """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
-
-    content = str(loaded_skill.get("content") or "")
-
-    parts = [activation_note, "", content.strip()]
-
-    if loaded_skill.get("setup_skipped"):
-        parts.extend(
-            [
-                "",
-                "[Skill setup note: Required environment setup was skipped. Continue loading the skill and explain any reduced functionality if it matters.]",
-            ]
-        )
-    elif loaded_skill.get("gateway_setup_hint"):
-        parts.extend(
-            [
-                "",
-                f"[Skill setup note: {loaded_skill['gateway_setup_hint']}]",
-            ]
-        )
-    elif loaded_skill.get("setup_needed") and loaded_skill.get("setup_note"):
-        parts.extend(
-            [
-                "",
-                f"[Skill setup note: {loaded_skill['setup_note']}]",
-            ]
-        )
-
-    supporting = []
-    linked_files = loaded_skill.get("linked_files") or {}
-    for entries in linked_files.values():
-        if isinstance(entries, list):
-            supporting.extend(entries)
-
-    if not supporting and skill_dir:
-        for subdir in ("references", "templates", "scripts", "assets"):
-            subdir_path = skill_dir / subdir
-            if subdir_path.exists():
-                for f in sorted(subdir_path.rglob("*")):
-                    if f.is_file():
-                        rel = str(f.relative_to(skill_dir))
-                        supporting.append(rel)
-
-    if supporting and skill_dir:
-        skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
-        parts.append("")
-        parts.append("[This skill has supporting files you can load with the skill_view tool:]")
-        for sf in supporting:
-            parts.append(f"- {sf}")
-        parts.append(
-            f'\nTo view any of these, use: skill_view(name="{skill_view_target}", file_path="<path>")'
-        )
-
-    if user_instruction:
-        parts.append("")
-        parts.append(f"The user has provided the following instruction alongside the skill invocation: {user_instruction}")
-
-    if runtime_note:
-        parts.append("")
-        parts.append(f"[Runtime note: {runtime_note}]")
-
-    return "\n".join(parts)
+def _normalize_trigger_text(text: str) -> str:
+    """Lowercase and collapse whitespace for phrase matching."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -157,36 +39,38 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     global _skill_commands
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
+        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter
         if not SKILLS_DIR.exists():
             return _skill_commands
-        disabled = _get_disabled_skill_names()
         for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-            if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
+            path_str = str(skill_md)
+            if '/.git/' in path_str or '/.github/' in path_str or '/.hub/' in path_str:
                 continue
             try:
                 content = skill_md.read_text(encoding='utf-8')
                 frontmatter, body = _parse_frontmatter(content)
-                # Skip skills incompatible with the current OS platform
-                if not skill_matches_platform(frontmatter):
-                    continue
                 name = frontmatter.get('name', skill_md.parent.name)
-                # Respect user's disabled skills config
-                if name in disabled:
-                    continue
                 description = frontmatter.get('description', '')
+                metadata = frontmatter.get('metadata') if isinstance(frontmatter.get('metadata'), dict) else {}
+                hermes_meta = metadata.get('hermes') if isinstance(metadata.get('hermes'), dict) else {}
                 if not description:
                     for line in body.strip().split('\n'):
                         line = line.strip()
                         if line and not line.startswith('#'):
                             description = line[:80]
                             break
+                auto_trigger_phrases = _coerce_string_list(
+                    hermes_meta.get("auto_trigger_phrases")
+                    or metadata.get("auto_trigger_phrases")
+                    or frontmatter.get("auto_trigger_phrases")
+                )
                 cmd_name = name.lower().replace(' ', '-').replace('_', '-')
                 _skill_commands[f"/{cmd_name}"] = {
                     "name": name,
                     "description": description or f"Invoke the {name} skill",
                     "skill_md_path": str(skill_md),
                     "skill_dir": str(skill_md.parent),
+                    "auto_trigger_phrases": auto_trigger_phrases,
                 }
             except Exception:
                 continue
@@ -202,12 +86,60 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     return _skill_commands
 
 
-def build_skill_invocation_message(
-    cmd_key: str,
-    user_instruction: str = "",
-    task_id: str | None = None,
-    runtime_note: str = "",
-) -> Optional[str]:
+def match_skill_command_from_text(user_text: str) -> Optional[str]:
+    """
+    Return the best matching skill command key for plain-language user text.
+
+    Matching is deterministic and phrase-based: skills can opt in via
+    metadata.hermes.auto_trigger_phrases in frontmatter.
+    """
+    normalized_text = _normalize_trigger_text(user_text)
+    if not normalized_text:
+        return None
+
+    best_match: Optional[str] = None
+    best_score = -1
+
+    for cmd_key, skill_info in get_skill_commands().items():
+        for phrase in skill_info.get("auto_trigger_phrases", []) or []:
+            normalized_phrase = _normalize_trigger_text(phrase)
+            if normalized_phrase and normalized_phrase in normalized_text:
+                score = len(normalized_phrase)
+                if score > best_score:
+                    best_match = cmd_key
+                    best_score = score
+
+    return best_match
+
+
+def build_auto_skill_invocation_message(user_text: str) -> Optional[Dict[str, str]]:
+    """
+    Build a slash-command-equivalent invocation message from plain user text.
+
+    Returns:
+        {"cmd_key", "skill_name", "message"} or None if no skill matches.
+    """
+    cmd_key = match_skill_command_from_text(user_text)
+    if not cmd_key:
+        return None
+
+    commands = get_skill_commands()
+    skill_info = commands.get(cmd_key)
+    if not skill_info:
+        return None
+
+    message = build_skill_invocation_message(cmd_key, user_text)
+    if not message:
+        return None
+
+    return {
+        "cmd_key": cmd_key,
+        "skill_name": skill_info["name"],
+        "message": message,
+    }
+
+
+def build_skill_invocation_message(cmd_key: str, user_instruction: str = "") -> Optional[str]:
     """Build the user message content for a skill slash command invocation.
 
     Args:
@@ -222,61 +154,39 @@ def build_skill_invocation_message(
     if not skill_info:
         return None
 
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
-    if not loaded:
-        return f"[Failed to load skill: {skill_info['name']}]"
+    skill_md_path = Path(skill_info["skill_md_path"])
+    skill_dir = Path(skill_info["skill_dir"])
+    skill_name = skill_info["name"]
 
-    loaded_skill, skill_dir, skill_name = loaded
-    activation_note = (
-        f'[SYSTEM: The user has invoked the "{skill_name}" skill, indicating they want '
-        "you to follow its instructions. The full skill content is loaded below.]"
-    )
-    return _build_skill_message(
-        loaded_skill,
-        skill_dir,
-        activation_note,
-        user_instruction=user_instruction,
-        runtime_note=runtime_note,
-    )
+    try:
+        content = skill_md_path.read_text(encoding='utf-8')
+    except Exception:
+        return f"[Failed to load skill: {skill_name}]"
 
+    parts = [
+        f'[SYSTEM: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
+        "",
+        content.strip(),
+    ]
 
-def build_preloaded_skills_prompt(
-    skill_identifiers: list[str],
-    task_id: str | None = None,
-) -> tuple[str, list[str], list[str]]:
-    """Load one or more skills for session-wide CLI preloading.
+    supporting = []
+    for subdir in ("references", "templates", "scripts", "assets"):
+        subdir_path = skill_dir / subdir
+        if subdir_path.exists():
+            for f in sorted(subdir_path.rglob("*")):
+                if f.is_file():
+                    rel = str(f.relative_to(skill_dir))
+                    supporting.append(rel)
 
-    Returns (prompt_text, loaded_skill_names, missing_identifiers).
-    """
-    prompt_parts: list[str] = []
-    loaded_names: list[str] = []
-    missing: list[str] = []
+    if supporting:
+        parts.append("")
+        parts.append("[This skill has supporting files you can load with the skill_view tool:]")
+        for sf in supporting:
+            parts.append(f"- {sf}")
+        parts.append(f'\nTo view any of these, use: skill_view(name="{skill_name}", file_path="<path>")')
 
-    seen: set[str] = set()
-    for raw_identifier in skill_identifiers:
-        identifier = (raw_identifier or "").strip()
-        if not identifier or identifier in seen:
-            continue
-        seen.add(identifier)
+    if user_instruction:
+        parts.append("")
+        parts.append(f"The user has provided the following instruction alongside the skill invocation: {user_instruction}")
 
-        loaded = _load_skill_payload(identifier, task_id=task_id)
-        if not loaded:
-            missing.append(identifier)
-            continue
-
-        loaded_skill, skill_dir, skill_name = loaded
-        activation_note = (
-            f'[SYSTEM: The user launched this CLI session with the "{skill_name}" skill '
-            "preloaded. Treat its instructions as active guidance for the duration of this "
-            "session unless the user overrides them.]"
-        )
-        prompt_parts.append(
-            _build_skill_message(
-                loaded_skill,
-                skill_dir,
-                activation_note,
-            )
-        )
-        loaded_names.append(skill_name)
-
-    return "\n\n".join(prompt_parts), loaded_names, missing
+    return "\n".join(parts)

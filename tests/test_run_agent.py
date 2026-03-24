@@ -467,6 +467,27 @@ class TestInit:
                 f"session_id doesn't match expected format: {a.session_id}"
             )
 
+    def test_ollama_embedding_model_replaced_with_configured_chat_model(self, monkeypatch):
+        """Embedding-only Ollama models should be replaced before chat starts."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            monkeypatch.setattr(
+                "hermes_cli.config.load_config",
+                lambda: {"model": {"default": "qwen3.5:35b"}},
+            )
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                model="nomic-embed-text:latest",
+                base_url="http://127.0.0.1:11434/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a.model == "qwen3.5:35b"
+
 
 class TestInterrupt:
     def test_interrupt_sets_flag(self, agent):
@@ -1201,6 +1222,70 @@ class TestRunConversation:
         assert result["final_response"] == "Got it"
         assert result["completed"] is True
         assert result["api_calls"] == 2
+
+    def test_resolve_ollama_fallback_target_prefers_running_model(self, agent, monkeypatch):
+        monkeypatch.delenv("HERMES_CODEX_FALLBACK_MODEL", raising=False)
+        monkeypatch.delenv("HERMES_CODEX_FALLBACK_BASE_URL", raising=False)
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        monkeypatch.setattr(agent, "_configured_default_model", lambda: None)
+
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"models": [{"name": "qwen3.5:35b"}, {"name": "nomic-embed-text:latest"}]}
+
+        calls = []
+
+        def _fake_get(url, timeout):
+            calls.append((url, timeout))
+            return _Response()
+
+        monkeypatch.setattr("run_agent.requests.get", _fake_get)
+
+        target = agent._resolve_ollama_fallback_target()
+
+        assert target == {
+            "provider": "ollama-local",
+            "api_mode": "chat_completions",
+            "model": "qwen3.5:35b",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "api_key": "ollama",
+        }
+        assert calls == [("http://127.0.0.1:11434/api/ps", 3)]
+
+    def test_resolve_ollama_fallback_target_skips_embedding_running_model(self, agent, monkeypatch):
+        monkeypatch.delenv("HERMES_CODEX_FALLBACK_MODEL", raising=False)
+        monkeypatch.setenv("HERMES_CODEX_FALLBACK_BASE_URL", "http://127.0.0.1:11434")
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        monkeypatch.setattr(agent, "_configured_default_model", lambda: None)
+
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen3.5:35b"}]}
+
+        calls = []
+
+        def _fake_get(url, timeout):
+            calls.append((url, timeout))
+            return _Response()
+
+        monkeypatch.setattr("run_agent.requests.get", _fake_get)
+
+        target = agent._resolve_ollama_fallback_target()
+
+        assert target == {
+            "provider": "ollama-local",
+            "api_mode": "chat_completions",
+            "model": "qwen3.5:35b",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "api_key": "ollama",
+        }
+        assert calls == [("http://127.0.0.1:11434/api/ps", 3)]
 
     def test_empty_content_retry_and_fallback(self, agent):
         """Empty content (only think block) retries, then falls back to partial."""

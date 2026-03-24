@@ -37,9 +37,14 @@ import logging
 import os
 import re
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional
+
+try:
+    import httpx
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    _HTTPX_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -59,17 +64,11 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     try:
         result = scan_skill(skill_dir, source="agent-created")
         allowed, reason = should_allow_install(result)
-        if allowed is False:
+        if not allowed:
             report = format_scan_report(result)
             return f"Security scan blocked this skill ({reason}):\n{report}"
-        if allowed is None:
-            # "ask" — allow but include the warning so the user sees the findings
-            report = format_scan_report(result)
-            logger.warning("Agent-created skill has security findings: %s", reason)
-            # Don't block — return None to allow, but log the warning
-            return None
     except Exception as e:
-        logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
+        logger.warning("Security scan failed for %s: %s", skill_dir, e)
     return None
 
 import yaml
@@ -197,38 +196,6 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     return None
 
 
-def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
-    """
-    Atomically write text content to a file.
-    
-    Uses a temporary file in the same directory and os.replace() to ensure
-    the target file is never left in a partially-written state if the process
-    crashes or is interrupted.
-    
-    Args:
-        file_path: Target file path
-        content: Content to write
-        encoding: Text encoding (default: utf-8)
-    """
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(
-        dir=str(file_path.parent),
-        prefix=f".{file_path.name}.tmp.",
-        suffix="",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding=encoding) as f:
-            f.write(content)
-        os.replace(temp_path, file_path)
-    except Exception:
-        # Clean up temp file on error
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
-        raise
-
-
 # =============================================================================
 # Core actions
 # =============================================================================
@@ -257,9 +224,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write SKILL.md atomically
+    # Write SKILL.md
     skill_md = skill_dir / "SKILL.md"
-    _atomic_write_text(skill_md, content)
+    skill_md.write_text(content, encoding="utf-8")
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
@@ -295,13 +262,13 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    _atomic_write_text(skill_md, content)
+    skill_md.write_text(content, encoding="utf-8")
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            _atomic_write_text(skill_md, original_content)
+            skill_md.write_text(original_content, encoding="utf-8")
         return {"success": False, "error": scan_error}
 
     return {
@@ -381,12 +348,12 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
-    _atomic_write_text(target, new_content)
+    target.write_text(new_content, encoding="utf-8")
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
-        _atomic_write_text(target, original_content)
+        target.write_text(original_content, encoding="utf-8")
         return {"success": False, "error": scan_error}
 
     replacements = count if replace_all else 1
@@ -433,13 +400,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    _atomic_write_text(target, file_content)
+    target.write_text(file_content, encoding="utf-8")
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            _atomic_write_text(target, original_content)
+            target.write_text(original_content, encoding="utf-8")
         else:
             target.unlink(missing_ok=True)
         return {"success": False, "error": scan_error}
@@ -491,13 +458,65 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     }
 
 
+def _install_skill(url: str, name: str = None, category: str = None) -> Dict[str, Any]:
+    """Install a skill from a remote URL (SKILL.md or manifest.json)."""
+    if not _HTTPX_AVAILABLE:
+        return {"success": False, "error": "httpx is required for remote install. Run: pip install httpx"}
+
+    try:
+        resp = httpx.get(url, timeout=15, follow_redirects=True, headers={"User-Agent": "hermes-agent/1.0"})
+        resp.raise_for_status()
+        content = resp.text
+    except Exception as e:
+        return {"success": False, "error": f"Failed to fetch {url}: {e}"}
+
+    # If it's a manifest.json, fetch the SKILL.md from the entrypoint
+    if url.endswith("manifest.json") or content.strip().startswith("{"):
+        try:
+            manifest = json.loads(content)
+            entrypoint = manifest.get("entrypoint")
+            if not entrypoint:
+                return {"success": False, "error": "manifest.json has no 'entrypoint' field."}
+            resp = httpx.get(entrypoint, timeout=15, follow_redirects=True, headers={"User-Agent": "hermes-agent/1.0"})
+            resp.raise_for_status()
+            content = resp.text
+        except json.JSONDecodeError:
+            return {"success": False, "error": "URL returned invalid JSON for manifest."}
+        except Exception as e:
+            return {"success": False, "error": f"Failed to fetch entrypoint {entrypoint}: {e}"}
+
+    # Validate it's a proper SKILL.md
+    err = _validate_frontmatter(content)
+    if err:
+        return {"success": False, "error": f"Fetched content is not a valid SKILL.md: {err}"}
+
+    # Extract name from frontmatter if not provided
+    if not name:
+        try:
+            end_match = re.search(r'\n---\s*\n', content[3:])
+            parsed = yaml.safe_load(content[3:end_match.start() + 3])
+            name = parsed.get("name", "").strip()
+        except Exception:
+            pass
+    if not name:
+        return {"success": False, "error": "Could not determine skill name. Pass name explicitly."}
+
+    # Sanitize name
+    name = re.sub(r'[^a-z0-9._-]', '-', name.lower()).strip('-')
+    if not name:
+        return {"success": False, "error": "Invalid skill name after sanitization."}
+
+    # Create the skill
+    return _create_skill(name, content, category)
+
+
 # =============================================================================
 # Main entry point
 # =============================================================================
 
 def skill_manage(
     action: str,
-    name: str,
+    name: str = None,
     content: str = None,
     category: str = None,
     file_path: str = None,
@@ -505,13 +524,19 @@ def skill_manage(
     old_string: str = None,
     new_string: str = None,
     replace_all: bool = False,
+    url: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
 
     Returns JSON string with results.
     """
-    if action == "create":
+    if action == "install":
+        if not url:
+            return json.dumps({"success": False, "error": "url is required for 'install'. Provide the URL to a SKILL.md or manifest.json."}, ensure_ascii=False)
+        result = _install_skill(url, name, category)
+
+    elif action == "create":
         if not content:
             return json.dumps({"success": False, "error": "content is required for 'create'. Provide the full SKILL.md text (frontmatter + body)."}, ensure_ascii=False)
         result = _create_skill(name, content, category)
@@ -544,7 +569,7 @@ def skill_manage(
         result = _remove_file(name, file_path)
 
     else:
-        result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+        result = {"success": False, "error": f"Unknown action '{action}'. Use: install, create, edit, patch, delete, write_file, remove_file"}
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -556,10 +581,11 @@ def skill_manage(
 SKILL_MANAGE_SCHEMA = {
     "name": "skill_manage",
     "description": (
-        "Manage skills (create, update, delete). Skills are your procedural "
+        "Manage skills (install, create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
         "New skills go to ~/.hermes/skills/; existing skills can be modified wherever they live.\n\n"
-        "Actions: create (full SKILL.md + optional category), "
+        "Actions: install (from URL — fetches SKILL.md or manifest.json), "
+        "create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
         "delete, write_file, remove_file.\n\n"
@@ -567,8 +593,7 @@ SKILL_MANAGE_SCHEMA = {
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure.\n"
         "Update when: instructions stale/wrong, OS-specific failures, "
-        "missing steps or pitfalls found during use. "
-        "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
+        "missing steps or pitfalls found during use.\n\n"
         "After difficult/iterative tasks, offer to save as a skill. "
         "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
         "Good skills: trigger conditions, numbered steps with exact commands, "
@@ -579,8 +604,15 @@ SKILL_MANAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
-                "description": "The action to perform."
+                "enum": ["install", "create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "description": "The action to perform. Use 'install' to fetch a skill from a URL."
+            },
+            "url": {
+                "type": "string",
+                "description": (
+                    "URL to a SKILL.md or manifest.json file. Required for 'install'. "
+                    "The skill will be fetched and installed locally."
+                )
             },
             "name": {
                 "type": "string",
@@ -638,7 +670,7 @@ SKILL_MANAGE_SCHEMA = {
                 "description": "Content for the file. Required for 'write_file'."
             },
         },
-        "required": ["action", "name"],
+        "required": ["action"],
     },
 }
 
@@ -652,13 +684,13 @@ registry.register(
     schema=SKILL_MANAGE_SCHEMA,
     handler=lambda args, **kw: skill_manage(
         action=args.get("action", ""),
-        name=args.get("name", ""),
+        name=args.get("name"),
         content=args.get("content"),
         category=args.get("category"),
         file_path=args.get("file_path"),
         file_content=args.get("file_content"),
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False)),
-    emoji="📝",
+        replace_all=args.get("replace_all", False),
+        url=args.get("url")),
 )
